@@ -28,7 +28,11 @@ class PayoutService:
         Fetches payouts -> claims them atomically -> and processes claimed ones.
         """
         print("[PayoutService] Starting webhook processing")
+        self._ensure_connection()
         
+        # 0. clean up any stuck payouts from last failures
+        self.cleanup_stuck_payouts(timeout_minutes=5)
+
         # 1. Fetch all notifying payouts
         payouts = self._fetch_payouts_from_expenzy()
         print(f"[PayoutService] Fetched {len(payouts)} payouts from Expenzy")
@@ -46,9 +50,12 @@ class PayoutService:
         print(f"[PayoutService] Successfully claimed {len(claimed_payouts)} out of {len(payouts)} payouts")
         
         # 3. process only claimed payouts
+        success_count = 0
         for payout in claimed_payouts:
-            self._process_payout(payout)
+            if self._process_payout(payout):
+                success_count += 1
         
+        print(f"[PayoutService] Successfully processed {success_count}/{len(claimed_payouts)} claimed payouts")
         print("[PayoutService] Webhook processing complete")
     
     def _fetch_payouts_from_expenzy(self):
@@ -75,6 +82,13 @@ class PayoutService:
         True: if new insert
         False: if exist already
         """
+        #validation for required fields
+        required_fields = ['id', 'create_time', 'amount', 'recipient_account_identifier']
+        for field in required_fields:
+            if field not in payout:
+                print(f"[PayoutService] Invalid payout data, missing field: {field}")
+                return False
+            
         query = """
             INSERT INTO holvi_received_payout (
                 expenzy_uuid,
@@ -105,12 +119,13 @@ class PayoutService:
                 return False
                 
         except Exception as e:
-            print(f"[PayoutService] Error claiming payout {payout['id']}: {e}")
+            print(f"[PayoutService] Error claiming payout {payout.get('id', 'unknown')}: {e}")
             return False
     
     def _process_payout(self, payout):
         """
         process claimed payout. Update state in expenzy as completed.
+        Returns True if successful, else False
         """
         payout_id = payout['id']
         
@@ -121,9 +136,12 @@ class PayoutService:
             # Mark as completed in DB
             self._mark_completed(payout_id)
             print(f"[PayoutService] Successfully processed payout {payout_id}")
+            return True
         else:
             print(f"[PayoutService] Failed to update Expenzy state for payout {payout_id}")
-            # DISCLAIMER: Payout stays in 'processing' state, can be handled by reconciliation later
+            return False
+            # Note: Payout stays in 'processing' state
+            # Will be reset to 'pending' by cleanup_stuck_payouts on next webhook
     
     def _update_expenzy_state(self, payout_id, max_retries=3):
         """
@@ -171,6 +189,48 @@ class PayoutService:
             print(f"[PayoutService] Marked {payout_id} as completed")
         except Exception as e:
             print(f"[PayoutService] Error marking {payout_id} as completed: {e}")
+    
+    def cleanup_stuck_payouts(self, timeout_minutes=5):
+        """
+        reset payouts stuck in processing for longer time.
+        example: webhook crashed mid of processing
+        """
+        query = """
+            UPDATE holvi_received_payout
+            SET processing_status = 'pending',
+                processing_started_at = NULL
+            WHERE processing_status = 'processing'
+            AND processing_started_at < NOW() - INTERVAL '%s minutes'
+            RETURNING expenzy_uuid
+        """
+        
+        try:
+            query_formatted = query % timeout_minutes
+            results = self.db.fetch_results(query_formatted)
+            
+            if results:
+                reset_count = len(results)
+                print(f"[PayoutService] Reset {reset_count} stuck payouts back to 'pending'")
+                for (uuid,) in results:
+                    print(f"[PayoutService] Reset stuck payout: {uuid}")
+            
+        except Exception as e:
+            print(f"[PayoutService] Error cleaning up stuck payouts: {e}")
+    
+    def _ensure_connection(self):
+        """
+        mkae sure DB connection is alive, if not reconnect
+        """
+        try:
+            # test
+            self.db.fetch_one("SELECT 1")
+        except Exception as e:
+            print(f"[PayoutService] Database connection lost, reconnecting: {e}")
+            try:
+                self.db.close()
+            except:
+                pass
+            self.db = self._create_db_connection()
     
     def close(self):
         self.db.close()
