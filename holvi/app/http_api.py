@@ -8,29 +8,29 @@ from flask import Flask
 
 from database import DBConnection
 from payout_service import PayoutService
+from connection_pool import close_connection_pool
+import atexit
 
 app = Flask(__name__)
 
 EXPENZY_API_BASE_URL = os.environ.get("EXPENZY_API_BASE_URL", "127.0.0.1")
 
+# Close pool on shutdown
+atexit.register(close_connection_pool)
+
 
 @app.route("/expenzy/webhook/", methods=["GET"])
 def expenzy_webhook():
     print("Webhook received")
-    # Here we are getting the notification from expenzy
-    service = None
+
     try:
-        # Create service and process webhook
+        # create service using conn pooling
         service = PayoutService()
         service.process_webhook()
         return "ok"
     except Exception as e:
         print(f"Error processing webhook: {e}")
-        # Return ok (webhook received, even on error)
         return "ok"
-    finally:
-        if service:
-            service.close()
 
 
 @app.route("/payout/count", methods=["GET"])
